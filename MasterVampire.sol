@@ -911,7 +911,7 @@ library VampireAdapter {
     }
 
     function withdraw(Victim victim, uint256 poolId, uint256 amount) external {
-        (bool success,) = address(victim).delegatecall(abi.encodeWithSignature("withdraw(address,uint256,uint256)", address(victim), poolId, amount));
+            (bool success,) = address(victim).delegatecall(abi.encodeWithSignature("withdraw(address,uint256,uint256)", address(victim), poolId, amount));
         require(success, "withdraw(uint256 poolId, uint256 amount) delegatecall failed.");
     }
     
@@ -1297,16 +1297,19 @@ contract MasterVampire is Ownable {
         uint256 rewardPerBlock;
         uint256 lastRewardBlock;
         uint256 accVampireSPerShare;
+        uint256 amountToDev;
     }
 
     VMPRTOKEN public vampireS;
-    IERC20 busd;
+    IERC20 public vampireLP;
+    IERC20 public busd;
+
     IUniswapV2Pair vampiresBusdPair;
 
     address public poolRewardUpdater;
     address public devAddress;
     uint256 public constant DEV_FEE_MINT = 5;
-    uint256 public constant REWARD_START_BLOCK = 11008888;
+    uint256 public constant REWARD_START_BLOCK = 6163653;
     uint256 public depositFee = 2;
     uint256 public withdrawFee = 1;
 
@@ -1315,7 +1318,7 @@ contract MasterVampire is Ownable {
 
     mapping (uint256 => mapping (address => UserInfo)) public userInfo;
 
-    event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
+    event Deposit(address indexed user, uint256 indexed pid, uint256 amountToDeposit);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
 
@@ -1330,8 +1333,11 @@ contract MasterVampire is Ownable {
     }
 
     constructor(
-        VMPRTOKEN _vampireS
+        VMPRTOKEN _vampireS,
+        IERC20 _vampireLP
+        
     ) public {
+        vampireLP = _vampireLP;
         vampireS = _vampireS;
         devAddress = msg.sender;
         busd = IERC20(0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56);
@@ -1349,7 +1355,8 @@ contract MasterVampire is Ownable {
             victimPoolId: _victimPoolId,
             rewardPerBlock: _rewardPerBlock,
             lastRewardBlock: block.number < REWARD_START_BLOCK ? REWARD_START_BLOCK : block.number,
-            accVampireSPerShare: 0
+            accVampireSPerShare: 0,
+            amountToDev: 0
         }));
     }
 
@@ -1385,7 +1392,7 @@ contract MasterVampire is Ownable {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accVampireSPerShare = pool.accVampireSPerShare;
-        uint256 lpSupply = _pid == 0 ? vampiresBusdPair.balanceOf(address(this)) : pool.victim.lockedAmount(pool.victimPoolId);
+        uint256 lpSupply = _pid == 0 ? vampireLP.balanceOf(address(this)) : pool.victim.lockedAmount(pool.victimPoolId);
         if (block.number > pool.lastRewardBlock && lpSupply != 0) {
             uint256 blocksToReward = block.number.sub(pool.lastRewardBlock);
             uint256 vampiresReward = blocksToReward.mul(pool.rewardPerBlock);
@@ -1407,12 +1414,11 @@ contract MasterVampire is Ownable {
         if (block.number <= pool.lastRewardBlock) {
             return;
         }
-
-        uint256 lpSupply = _pid == 0 ? vampiresBusdPair.balanceOf(address(this)) : pool.victim.lockedAmount(pool.victimPoolId);
+        uint256 lpSupply = _pid == 0 ? vampireLP.balanceOf(address(this)) : pool.victim.lockedAmount(pool.victimPoolId);
         if (lpSupply == 0) {
             pool.lastRewardBlock = block.number;
             return;
-        }
+        }   
 
         uint256 blocksToReward = block.number.sub(pool.lastRewardBlock);
         uint256 vampiresReward = blocksToReward.mul(pool.rewardPerBlock);
@@ -1426,6 +1432,7 @@ contract MasterVampire is Ownable {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
         updatePool(_pid);
+        
         if (user.amount > 0) {
             uint256 pending = user.amount.mul(pool.accVampireSPerShare).div(1e12).sub(user.rewardDebt);
             if(pending > 0) {
@@ -1438,19 +1445,17 @@ contract MasterVampire is Ownable {
         
         if(_amount > 0) {
             if(_pid == 0) {
-                IERC20(address(vampiresBusdPair)).safeTransferFrom(address(msg.sender), address(this), amountToDeposit);
-                IERC20(address(vampiresBusdPair)).safeTransferFrom(address(msg.sender), address(devAddress), amountDevFee);
+                vampireLP.safeTransferFrom(address(msg.sender), address(this), _amount);
             } else {
-                pool.victim.lockableToken(pool.victimPoolId).safeTransferFrom(address(msg.sender), address(this), amountToDeposit);
-                pool.victim.lockableToken(pool.victimPoolId).safeTransferFrom(address(msg.sender), address(devAddress), amountDevFee);
+                pool.victim.lockableToken(pool.victimPoolId).safeTransferFrom(address(msg.sender), address(this), _amount);
                 pool.victim.deposit(pool.victimPoolId, amountToDeposit);
             }
-
+            pool.amountToDev = pool.amountToDev.add(amountDevFee);
             user.amount = user.amount.add(amountToDeposit);
         }
-
+    
         user.rewardDebt = user.amount.mul(pool.accVampireSPerShare).div(1e12);
-        emit Deposit(msg.sender, _pid, amountToDeposit);
+        emit Deposit(msg.sender, _pid, _amount);
     }
     
     function withdraw(uint256 _pid, uint256 _amount) public {
@@ -1466,15 +1471,17 @@ contract MasterVampire is Ownable {
 
         if(_amount > 0) {
             user.amount = user.amount.sub(_amount);
+            pool.amountToDev = pool.amountToDev.add(amountDevFeeWithdraw);
             if(_pid == 0) {
-                IERC20(address(vampiresBusdPair)).safeTransfer(address(devAddress), amountDevFeeWithdraw);
-                IERC20(address(vampiresBusdPair)).safeTransfer(address(msg.sender), _amount.sub(amountDevFeeWithdraw));
+                vampireLP.safeTransfer(address(this), amountDevFeeWithdraw);
+                vampireLP.safeTransfer(address(msg.sender), _amount.sub(amountDevFeeWithdraw));
             } else {
                 pool.victim.withdraw(pool.victimPoolId, _amount);
-                pool.victim.lockableToken(pool.victimPoolId).safeTransfer(address(devAddress), amountDevFeeWithdraw);
+                pool.victim.lockableToken(pool.victimPoolId).safeTransfer(address(this), amountDevFeeWithdraw);
                 pool.victim.lockableToken(pool.victimPoolId).safeTransfer(address(msg.sender), _amount.sub(amountDevFeeWithdraw));
             }
         }
+        
         user.rewardDebt = user.amount.mul(pool.accVampireSPerShare).div(1e12);
         emit Withdraw(msg.sender, _pid, _amount);
     }
@@ -1485,16 +1492,17 @@ contract MasterVampire is Ownable {
         uint256 amount = user.amount;
         uint256 amountDevFeeWithdraw = amount.mul(withdrawFee).div(100);
         if(_pid == 0) {
-            IERC20(address(vampiresBusdPair)).safeTransfer(address(devAddress), amountDevFeeWithdraw);
-            IERC20(address(vampiresBusdPair)).safeTransfer(address(msg.sender), amount.sub(amountDevFeeWithdraw));
+            vampireLP.safeTransfer(address(this), amountDevFeeWithdraw);
+            vampireLP.safeTransfer(address(msg.sender), amount.sub(amountDevFeeWithdraw));
         } else {
             pool.victim.withdraw(pool.victimPoolId, amount);
-            pool.victim.lockableToken(pool.victimPoolId).safeTransfer(address(devAddress), amountDevFeeWithdraw);
+            pool.victim.lockableToken(pool.victimPoolId).safeTransfer(address(this), amountDevFeeWithdraw);
             pool.victim.lockableToken(pool.victimPoolId).safeTransfer(address(msg.sender), amount.sub(amountDevFeeWithdraw));
         }
         emit EmergencyWithdraw(msg.sender, _pid, user.amount);
         user.amount = 0;
         user.rewardDebt = 0;
+        pool.amountToDev = pool.amountToDev.add(amountDevFeeWithdraw);
     }
 
     function safeVampireSTransfer(address _to, uint256 _amount) internal {
@@ -1514,12 +1522,23 @@ contract MasterVampire is Ownable {
         withdrawFee = _withdrawFee;
     }
     
+    function claimRewardByDev(uint256 _pid) public onlyOwner {
+        PoolInfo storage pool = poolInfo[_pid];
+        uint256 amountToClaim = pool.amountToDev;
+         if(_pid == 0) {
+            vampireLP.safeTransfer(address(devAddress), amountToClaim);
+        } else {
+            pool.victim.lockableToken(pool.victimPoolId).safeTransfer(address(devAddress), amountToClaim);
+        }
+        pool.amountToDev = 0;
+    }
+    
     function drain(uint256 _pid) public {
         require(_pid != 0, "Can't drain from myself");
         PoolInfo storage pool = poolInfo[_pid];
         Victim victim = pool.victim;
         uint256 victimPoolId = pool.victimPoolId;
-        victim.claimReward(victimPoolId);
+        victim.claimReward(victimPoolId);   
         IERC20 rewardToken = victim.rewardToken();
         uint256 claimedReward = rewardToken.balanceOf(address(this));
         uint256 sellableAmount = victim.sellableRewardAmount();
